@@ -29,6 +29,15 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+def fix_interleave(x, size):
+    s = list(x.shape)
+    return x.reshape([-1, size] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+
+
+def de_interleave(x, size):
+    s = list(x.shape)
+    return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+
 def new_main():
     parser = argparse.ArgumentParser(description='SSL model Training')
 
@@ -41,7 +50,7 @@ def new_main():
     parser.add_argument('--ex-epochs', default=10, type=int)
     parser.add_argument('--epochs', default=1000, type=int)
     parser.add_argument('--start-epoch', default=0, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.03, type=float)
     parser.add_argument('--wdecay', default=5e-4, type=float)
     parser.add_argument('--ema-decay', default=0.999, type=float)
 
@@ -59,7 +68,7 @@ def new_main():
     parser.add_argument('--max-alpha', default=3)
     parser.add_argument('--T1', default=10, type=int)
     parser.add_argument('--T2', default=60, type=int)
-    parser.add_argument('--nesterov', action='store_true')
+    parser.add_argument('--nesterov', action='store_true', default=True)
 
     parser.add_argument('--gpu', default='0')
     parser.add_argument('--seed', default=0, type=int)
@@ -130,8 +139,6 @@ def new_main():
         if args.use_ema:
             ema_model = ModelEMA(args, model, args.ema_decay)
 
-        semi_criterion = SemiLoss()
-        u_criterion = nn.MSELoss()
         optimizer = optim.SGD(grouped_parameters, lr=args.lr,
                               momentum=0.9, nesterov=args.nesterov)
         scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 0.95**epoch)
@@ -143,7 +150,7 @@ def new_main():
 
         patience_check = 0
 
-        FixMatch_train(train_loader, unlabel_loader, model, optimizer, ema_optimizer, args)
+        FixMatch_train(args, train_loader, unlabel_loader,val_loader,  model, optimizer, ema_model, scheduler, patience_check)
 
             # val_loss, val_acc = evaluation(val_loader, model, criterion)
 
@@ -210,24 +217,39 @@ def FixMatch_train(args, train_loader, unlabeled_loader, test_loader, model, opt
             targets_x = targets_x.long()
 
             try:
-                (inputs_u, inputs_u2), _ = next(unlabeled_iter)
+                (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
             except:
                 if args.world_size > 1:
                     unlabeled_epoch += 1
                     unlabeled_loader.sampler.set_epoch(unlabeled_epoch)
                 unlabeled_iter = iter(unlabeled_loader)
-                (inputs_u, inputs_u2), _ = next(unlabeled_iter)
+                (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
 
-            outputs = model(inputs)
+            data_time.update(time.time() - end)
+            batch_size = inputs_x.size[0]
+            inputs = fix_interleave(torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+            targets_x = targets_x.to(args.device)
+            logits = model(inputs)
+            logits = de_interleave(logits, 2 * args.mu + 1)
+            logits_x = logits[:batch_size]
+            logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+            del logits
 
-            loss = F.cross_entropy(outputs, targets)
-            # prec,_ = accuracy(outputs, targets, topk=(1,5))
+            Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
 
-            losses.update(loss.item(), inputs.size(0))
-            # acc.update(prec.item(), inputs.size(0))
+            pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+            max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+            mask = max_probs.ge(args.threshold).float()
 
+            Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                  reduction='none') * mask).mean()
+
+            loss = Lx + args.lambda_u * Lu
+
+            losses.update(loss.item())
             loss.backward()
             optimizer.step()
+            scheduler.step()
             if args.use_ema:
                 ema_model.update(model)
             model.zero_grad()
@@ -235,16 +257,18 @@ def FixMatch_train(args, train_loader, unlabeled_loader, test_loader, model, opt
 
             batch_time.update(time.time() - end)
             end = time.time()
+            mask_probs.update(mask.mean().item())
             if not args.no_progress:
                 p_bar.set_description(
-                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}.".format(
+                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Mask: {mask:.2f}.".format(
                         epoch=epoch + 1,
                         epochs=args.epochs,
                         batch=batch_idx + 1,
                         iter=args.train_iteration,
                         data=data_time.avg,
                         bt=batch_time.avg,
-                        loss=losses.avg))
+                        loss=losses.avg,
+                        mask=mask_probs.avg))
                 p_bar.update()
 
         if not args.no_progress:
